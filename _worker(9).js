@@ -4,7 +4,7 @@ import { connect } from "cloudflare:sockets";
 // CONSTANTS & DEFAULT CONFIGURATION
 // ============================================
 const DEFAULT_LOCAL_PROXIES = [
-  "bpb.yousef.isegaro.com",
+  "galaxytunnel.cloud-ip.cc",
   "icook.hk",
   "icook.tw",
   "www.visa.com.sg"
