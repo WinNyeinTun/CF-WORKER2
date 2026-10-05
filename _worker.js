@@ -10,14 +10,7 @@ const DEFAULT_LOCAL_PROXIES = [
   "www.visa.com.sg"
 ];
 
-const DEFAULT_DOH_URL = [
-  "https://dns.alidns.com/dns-query",
-  "https://cloudflare-dns.com/dns-query",
-  "https://dns.google/dns-query",
-  "https://dns.quad9.net/dns-query",
-  "https://dns.adguard-dns.com/dns-query"
-];
-const CLOUDFLARE_LOCATIONS_URL = "https://speed.cloudflare.com/locations";
+const DEFAULT_DOH_URL = ["https://cloudflare-dns.com/dns-query","https://dns.google/dns-query","https://dns.quad9.net/dns-query","https://dns.adguard-dns.com/dns-query"];
 const CONNECTION_TIMEOUT_MS = 30000; // 30 seconds timeout
 const DEFAULT_RATE_LIMIT_PER_MINUTE = 60;
 const DEFAULT_WS_PATH = "galaxy-tunnel";
@@ -1365,29 +1358,6 @@ const worker_default = {
       );
     }
 
-    // Cloudflare edge-location diagnostic endpoint. This is separate from
-    // VLESS traffic and is only used when a normal GET requests /locations.
-    if (url.pathname === "/locations" && request.method === "GET") {
-      try {
-        const locationResponse = await fetch(CLOUDFLARE_LOCATIONS_URL, {
-          cf: { cacheTtl: 300, cacheEverything: true }
-        });
-        return new Response(locationResponse.body, {
-          status: locationResponse.status,
-          headers: {
-            ...getSecurityHeaders(locationResponse.headers.get("content-type") || "application/json"),
-            "Cache-Control": "public, max-age=300"
-          }
-        });
-      } catch (error) {
-        logger.error("LOCATIONS_FETCH_ERROR", { error: error.message });
-        return new Response(JSON.stringify({ error: "Locations unavailable" }), {
-          status: 502,
-          headers: getSecurityHeaders("application/json")
-        });
-      }
-    }
-
     // CORS preflight options
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: getSecurityHeaders("text/plain") });
@@ -1624,7 +1594,7 @@ async function proxyOverWSHandler(
 }
 
 // ============================================
-// TCP OUTBOUND WITH TIMEOUT (RETRY REMOVED)
+// TCP OUTBOUND WITH TIMEOUT & HYBRID PROXY (Item 8)
 // ============================================
 async function handleTCPOutBound(
   remoteSocket,
@@ -1651,7 +1621,6 @@ async function handleTCPOutBound(
   const route = resolveRouteTarget(addressRemote, portRemote, routeRulesRaw, routeServersRaw, logger);
   const primaryAddress = route?.host || addressRemote;
   const primaryPort = route?.port || portRemote;
-  
   if (route) logger.info("DESTINATION_ROUTE_SELECTED", {
     destination: addressRemote,
     route: route.rule,
@@ -1672,26 +1641,48 @@ async function handleTCPOutBound(
     }, CONNECTION_TIMEOUT_MS);
   };
 
-  try {
+  async function connectAndWrite(address, port) {
     resetTimeout();
-    // Target ကို တိုက်ရိုက်ချိတ်ပါမယ်
-    const tcpSocket = connect({ hostname: primaryAddress, port: primaryPort });
-    remoteSocket.value = tcpSocket;
-    logger.info("TCP_CONNECTING", { target: `${primaryAddress}:${primaryPort}` });
+    const tcpSocket2 = connect({ hostname: address, port });
+    remoteSocket.value = tcpSocket2;
+    logger.info("TCP_CONNECTING", { target: `${address}:${port}` });
 
-    const writer = tcpSocket.writable.getWriter();
+    const writer = tcpSocket2.writable.getWriter();
     await writer.write(rawClientData);
     writer.releaseLock();
+    return tcpSocket2;
+  }
 
-    // Retry မပါတော့ဘဲ တိုက်ရိုက် Data လွှဲပေးပါမယ်
-    remoteSocketToWS(tcpSocket, webSocket, responseHeader, null, logger, resetTimeout);
+  async function retry() {
+    const activeProxy = await proxyPoolManager.getProxy(defaultProxy, rawProxyListUrl, logger);
+    const target = activeProxy || addressRemote;
+    logger.info("RETRYING_VIA_PROXY", { proxy: target, port: portRemote });
+
+    try {
+      const tcpSocket2 = await connectAndWrite(target, portRemote);
+      tcpSocket2.closed
+        .catch((error) => {
+          logger.warn("RETRY_TCP_CLOSED_ERROR", { error: error.message });
+        })
+        .finally(() => {
+          if (timeoutTimer) clearTimeout(timeoutTimer);
+          safeCloseWebSocket(webSocket);
+        });
+      remoteSocketToWS(tcpSocket2, webSocket, responseHeader, null, logger, resetTimeout);
+    } catch (retryErr) {
+      logger.error("RETRY_CONNECT_FAILED", { error: retryErr.message });
+      safeCloseWebSocket(webSocket);
+    }
+  }
+
+  try {
+    const tcpSocket = await connectAndWrite(primaryAddress, primaryPort);
+    remoteSocketToWS(tcpSocket, webSocket, responseHeader, retry, logger, resetTimeout);
   } catch (err) {
-    // ချိတ်လို့မရရင် Error ပြပြီး ချက်ချင်းပိတ်ပါမယ်
-    logger.error("DIRECT_TCP_FAILED", { error: err.message, target: primaryAddress });
-    safeCloseWebSocket(webSocket);
+    logger.warn("DIRECT_TCP_FAILED_RETRYING", { error: err.message });
+    await retry();
   }
 }
-
 
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, logger) {
   return new ReadableStream({
@@ -1906,44 +1897,6 @@ function safeCloseWebSocket(socket) {
   }
 }
 
-function normalizeDohResolvers(value) {
-  const values = Array.isArray(value) ? value : String(value || "").split(/[\s,]+/);
-  const resolvers = values
-    .map((item) => String(item || "").trim())
-    .filter((item) => /^https:\/\/[^\s]+\/dns-query(?:\?.*)?$/i.test(item));
-  return resolvers.length ? resolvers : DEFAULT_DOH_URL;
-}
-
-async function fetchDohWithFallback(resolvers, dnsMessage, logger) {
-  const candidates = normalizeDohResolvers(resolvers);
-  let lastError = null;
-
-  // Rotate the first resolver per query, then try the remaining resolvers if
-  // the selected provider is unavailable or returns a non-success response.
-  const start = Math.floor(Math.random() * candidates.length);
-  for (let offset = 0; offset < candidates.length; offset += 1) {
-    const resolver = candidates[(start + offset) % candidates.length];
-    try {
-      const response = await fetch(resolver, {
-        method: "POST",
-        headers: {
-          "content-type": "application/dns-message",
-          "accept": "application/dns-message"
-        },
-        body: dnsMessage
-      });
-      if (!response.ok) {
-        throw new Error(`${resolver} returned HTTP ${response.status}`);
-      }
-      return { response, resolver };
-    } catch (error) {
-      lastError = error;
-      logger.warn("DOH_RESOLVER_FAILED", { resolver, error: error.message });
-    }
-  }
-  throw lastError || new Error("No DoH resolver is available");
-}
-
 async function handleUDPOutBound(webSocket, responseHeader, dohURL, logger) {
   let isHeaderSent = false;
   const transformStream = new TransformStream({
@@ -1963,13 +1916,17 @@ async function handleUDPOutBound(webSocket, responseHeader, dohURL, logger) {
     .pipeTo(
       new WritableStream({
         async write(chunk) {
-          const { response: resp, resolver } = await fetchDohWithFallback(dohURL, chunk, logger);
+          const resp = await fetch(dohURL, {
+            method: "POST",
+            headers: { "content-type": "application/dns-message" },
+            body: chunk
+          });
           const dnsQueryResult = await resp.arrayBuffer();
           const udpSize = dnsQueryResult.byteLength;
           const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 255, udpSize & 255]);
 
           if (webSocket.readyState === 1) {
-            logger.info("DOH_QUERY_SUCCESS", { responseSize: udpSize, resolver });
+            logger.info("DOH_QUERY_SUCCESS", { responseSize: udpSize });
             if (isHeaderSent) {
               webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
             } else {
